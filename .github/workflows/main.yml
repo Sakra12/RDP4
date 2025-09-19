@@ -33,131 +33,176 @@ jobs:
               Write-Host "Could not restart Terminal Service: $($_.Exception.Message)"
             }
           } else {
-            Write-Host "Terminal Server registry path not found. This might be a hosted runner with limited RDP access."
+            Write-Host "Terminal Server registry path not found. Attempting to enable RDP via alternative method..."
+            # Alternative method using Enable-PSRemoting and firewall
+            try {
+              Enable-PSRemoting -Force -SkipNetworkProfileCheck
+              Set-NetFirewallRule -DisplayName "Remote Desktop*" -Enabled True
+              Write-Host "RDP enabled via alternative method"
+            } catch {
+              Write-Host "Alternative RDP enabling failed: $($_.Exception.Message)"
+            }
           }
 
       - name: Create RDP User with Secure Password
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          
           try {
+            Add-Type -AssemblyName System.Security
+            $charSet = @{
+                Upper   = [char[]](65..90)      # A-Z
+                Lower   = [char[]](97..122)     # a-z
+                Number  = [char[]](48..57)      # 0-9
+                Special = ([char[]](33..47) + [char[]](58..64) +
+                           [char[]](91..96) + [char[]](123..126)) # Special characters
+            }
+            $rawPassword = @()
+            $rawPassword += $charSet.Upper | Get-Random -Count 4
+            $rawPassword += $charSet.Lower | Get-Random -Count 4
+            $rawPassword += $charSet.Number | Get-Random -Count 4
+            $rawPassword += $charSet.Special | Get-Random -Count 4
+            $password = -join ($rawPassword | Sort-Object { Get-Random })
+            $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+            
+            # Remove existing user if exists
+            try { Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue } catch {}
+            
             New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction Stop
             Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction Stop
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction Stop
-            echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-            Write-Host "RDP user created successfully"
+            echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+            Write-Host "RDP user created successfully with username: RDP"
+            
           } catch {
             Write-Host "Error creating RDP user: $($_.Exception.Message)"
             exit 1
           }
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:github-actions
+
+      - name: Get Tailscale IP
+        run: |
+          # Wait a moment for Tailscale to be fully ready
+          Start-Sleep -Seconds 10
           
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-              Write-Error "User creation failed"
-              exit 1
+          # Get Tailscale IP using multiple methods
+          $tsIP = $null
+          $retries = 0
+          
+          while (-not $tsIP -and $retries -lt 20) {
+            try {
+              # Method 1: Use tailscale ip command
+              $tsIP = & tailscale ip -4 2>$null
+              if ($tsIP -and $tsIP.Trim() -ne "") {
+                $tsIP = $tsIP.Trim()
+                break
+              }
+              
+              # Method 2: Check network adapters for Tailscale interface
+              $tailscaleAdapter = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like "*Tailscale*" -or $_.Name -like "*Tailscale*" }
+              if ($tailscaleAdapter) {
+                $ipConfig = Get-NetIPAddress -InterfaceIndex $tailscaleAdapter.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+                if ($ipConfig) {
+                  $tsIP = $ipConfig.IPAddress
+                  break
+                }
+              }
+              
+            } catch {
+              Write-Host "Attempt $($retries + 1) failed: $($_.Exception.Message)"
+            }
+            
+            Start-Sleep -Seconds 5
+            $retries++
+            Write-Host "Waiting for Tailscale IP... Retry $retries/20"
           }
-
-      - name: Install Tailscale
-        run: |
-          try {
-            $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-            $installerPath = "$env:TEMP\tailscale.msi"
-            
-            Write-Host "Downloading Tailscale installer..."
-            Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -ErrorAction Stop
-            
-            Write-Host "Installing Tailscale..."
-            Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait -ErrorAction Stop
-            
-            Write-Host "Cleaning up installer..."
-            Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-            
-            Write-Host "Tailscale installation completed"
-          } catch {
-            Write-Host "Error during Tailscale installation: $($_.Exception.Message)"
+          
+          if (-not $tsIP) {
+            Write-Error "Could not obtain Tailscale IP after 20 retries"
+            # Show network information for debugging
+            Write-Host "Available network adapters:"
+            Get-NetAdapter | Select-Object Name, InterfaceDescription, Status | Format-Table
+            Write-Host "IP Addresses:"
+            Get-NetIPAddress -AddressFamily IPv4 | Select-Object IPAddress, InterfaceAlias | Format-Table
             exit 1
           }
-
-      - name: Establish Tailscale Connection
-        run: |
-          try {
-            $tailscaleExe = "$env:ProgramFilesTailscale\tailscale.exe"
-            
-            if (-not (Test-Path $tailscaleExe)) {
-              Write-Error "Tailscale executable not found at $tailscaleExe"
-              exit 1
-            }
-            
-            Write-Host "Connecting to Tailscale..."
-            & $tailscaleExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-            
-            Write-Host "Waiting for Tailscale IP assignment..."
-            $tsIP = $null
-            $retries = 0
-            while (-not $tsIP -and $retries -lt 15) {
-                $tsIP = & $tailscaleExe ip -4 2>$null
-                if ($tsIP) { break }
-                Start-Sleep -Seconds 5
-                $retries++
-                Write-Host "Retry $retries/15..."
-            }
-            
-            if (-not $tsIP) {
-                Write-Error "Tailscale IP not assigned after 15 retries. Exiting."
-                exit 1
-            }
-            
-            echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-            Write-Host "Tailscale IP assigned: $tsIP"
-          } catch {
-            Write-Host "Error establishing Tailscale connection: $($_.Exception.Message)"
-            exit 1
-          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP obtained: $tsIP"
 
       - name: Verify RDP Accessibility
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Testing RDP connectivity on Tailscale IP: $env:TAILSCALE_IP"
           
           try {
             $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
             if ($testResult.TcpTestSucceeded) {
-              Write-Host "TCP connectivity to port 3389 successful!"
+              Write-Host "✅ RDP port 3389 is accessible via Tailscale!"
             } else {
-              Write-Host "Warning: TCP connection to RDP port 3389 failed. RDP might not be fully accessible."
+              Write-Host "⚠️  RDP port 3389 test failed, but this might be normal on hosted runners"
             }
           } catch {
-            Write-Host "Could not test RDP connectivity: $($_.Exception.Message)"
+            Write-Host "RDP connectivity test error: $($_.Exception.Message)"
+          }
+          
+          # Also test if RDP service is running
+          $rdpService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
+          if ($rdpService) {
+            Write-Host "Terminal Service Status: $($rdpService.Status)"
+            if ($rdpService.Status -ne "Running") {
+              try {
+                Start-Service -Name "TermService" -ErrorAction Stop
+                Write-Host "Terminal Service started successfully"
+              } catch {
+                Write-Host "Could not start Terminal Service: $($_.Exception.Message)"
+              }
+            }
           }
 
-      - name: Maintain Connection
+      - name: Display Connection Information
         run: |
-          Write-Host "`n=== RDP ACCESS INFORMATION ==="
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $($env:RDP_CREDS -replace 'User: RDP | Password: ', '')"
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "🎯 RDP CONNECTION DETAILS"
+          Write-Host "======================================"
+          Write-Host "Server Address: $env:TAILSCALE_IP"
           Write-Host "Port: 3389"
-          Write-Host "=============================`n"
-          
-          Write-Host "Note: If you cannot connect via RDP, it might be due to GitHub hosted runner limitations."
-          Write-Host "Consider using a self-hosted runner for full RDP access.`n"
-          
-          # Keep runner active
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "======================================"
+          Write-Host ""
+          Write-Host "📝 Instructions:"
+          Write-Host "1. Make sure you have Tailscale installed and connected on your local machine"
+          Write-Host "2. Use Remote Desktop Connection (mstsc) or any RDP client"
+          Write-Host "3. Connect to: $env:TAILSCALE_IP:3389"
+          Write-Host "4. Use the credentials shown above"
+          Write-Host ""
+          Write-Host "⚠️  Note: If connection fails, this might be due to GitHub hosted runner limitations."
+          Write-Host "   Consider using a self-hosted runner for guaranteed RDP access."
+          Write-Host ""
+
+      - name: Keep Session Active
+        run: |
           $counter = 0
           while ($true) {
-              $counter++
-              Write-Host "[$counter] [$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+            $counter++
+            $currentTime = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            Write-Host "[$counter] [$currentTime] 🔄 Session Active - Tailscale IP: $env:TAILSCALE_IP"
+            
+            # Periodic connectivity check
+            if ($counter % 4 -eq 0) {  # Every 20 minutes
+              try {
+                $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+                $status = if ($testResult.TcpTestSucceeded) { "✅ Online" } else { "⚠️  Limited" }
+                Write-Host "RDP Status: $status"
+              } catch {
+                Write-Host "RDP Status: ❌ Error"
+              }
+            }
+            
+            Start-Sleep -Seconds 300  # 5 minutes
           }
